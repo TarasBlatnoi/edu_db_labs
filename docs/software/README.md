@@ -1,6 +1,7 @@
 # Реалізація інформаційного та програмного забезпечення
 
-В рамках проєкту розробляється: 
+В рамках проєкту розробляється:
+
 ## SQL-скрипт для створення на початкового наповнення бази даних
 
 ```sql
@@ -253,3 +254,268 @@ INSERT INTO `project_db`.`tasks` (`Name`, `Developer`, `Status`, `Deadline`, `Pr
 
 - RESTfull сервіс для управління даними
 
+## Вхідний файл програми
+
+```js
+"use strict";
+
+require("dotenv").config();
+const express = require("express");
+const app = express();
+const db = require("./database");
+const userRoutes = require("./routes/userRoutes");
+
+app.use(express.json());
+app.use("/users", userRoutes);
+
+const PORT = process.env.PORT || 3000;
+
+const server = app.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
+
+const closeServer = async () => {
+  console.log("\nStarting the process of closing the app...");
+  try {
+    await db.pool.end();
+    await db.promisePool.end();
+    await server.close(() => {
+      console.log("App is closed :(");
+      process.exit();
+    });
+  } catch (err) {
+    console.error("Error while closing the app: " + err.message);
+    process.exit(1);
+  }
+};
+
+process.on("SIGINT", closeServer);
+process.on("SIGTERM", closeServer);
+```
+
+## Файл для встановлення доступу до бази даних
+
+```js
+"use strict";
+
+require("dotenv").config();
+const promiseMysql = require("mysql2/promise");
+
+const access = {
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  database: process.env.DB_NAME,
+  password: process.env.DB_PASSWORD,
+};
+
+const promisePool = promiseMysql.createPool(access);
+
+const promiseConnectionFactory = () => promiseMysql.createConnection(access);
+
+module.exports = {
+  promisePool,
+  promiseConnectionFactory,
+};
+```
+
+## CRUD для користувачів
+
+```js
+"use strict";
+
+const express = require("express");
+const userController = require("../controllers/userController");
+const router = new express.Router();
+router
+  .route("/")
+  .get(userController.getAllUsers)
+  .post(userController.createUser);
+
+router
+  .route("/:id")
+  .get(userController.getUserById)
+  .patch(userController.updateUser)
+  .delete(userController.deleteUser);
+
+module.exports = router;
+```
+
+## Базовий клас з методами присутніми для управління даними таблиці з користувачами
+
+```js
+const db = require("../database");
+
+class User {
+  static async getAll() {
+    const sql = `
+        SELECT * 
+        FROM users;
+        `;
+    let connection;
+    try {
+      connection = await db.promisePool.getConnection();
+      const users = await connection.execute(sql);
+      return users[0];
+    } catch (err) {
+      console.error(err);
+    } finally {
+      if (connection) {
+        await connection.release();
+      }
+    }
+  }
+
+  static async getById(id) {
+    const sql = `SELECT * FROM users WHERE id = ${id};`;
+    let connection;
+    try {
+      connection = await db.promisePool.getConnection();
+      const [res] = await connection.query(sql);
+      return res;
+    } catch (err) {
+      console.error(err);
+    } finally {
+      if (connection) {
+        await connection.release();
+      }
+    }
+  }
+
+  static async updateById(id, { login, picture, password, email, role }) {
+    const sql = `
+        UPDATE project_db.users 
+        SET 
+          Login = ?,
+          Picture = ?,
+          Password = ?,
+          Email = ?,
+          Role = ?
+        WHERE id = ?;
+    `;
+
+    let connection;
+    try {
+      connection = await db.promisePool.getConnection();
+      await connection.beginTransaction();
+      await connection.execute(sql, [
+        login,
+        picture,
+        password,
+        email,
+        role,
+        id,
+      ]);
+      await connection.commit();
+      return User.getById(id);
+    } catch (err) {
+      await connection.rollback();
+      console.log(err);
+    } finally {
+      if (connection) {
+        await connection.release();
+      }
+    }
+  }
+
+  static async create({ login, picture, password, email, role }) {
+    const sql = `
+        INSERT INTO project_db.users (login, picture, password, email, role)
+        VALUES (?, ?, ?, ?, ?);
+        `;
+    let connection;
+    try {
+      connection = await db.promisePool.getConnection();
+      const [res] = await connection.execute(sql, [
+        login,
+        picture,
+        password,
+        email,
+        role,
+      ]);
+      const createdUserId = res.insertId;
+      console.log(`User with ID ${createdUserId} created successfully.`);
+      return User.getById(createdUserId);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      if (connection) {
+        await connection.release();
+      }
+    }
+  }
+
+  static async deleteById(id) {
+    const user = await User.getById(id);
+    const deleteProjectsMembersSql = `DELETE FROM project_db.projects_members WHERE MemberId = ${id}`;
+    const deleteMembersSql = `DELETE FROM project_db.members WHERE UserId = ${id}`;
+    const deleteUsersSql = `DELETE FROM project_db.users WHERE id = ${id}`;
+
+    let connection;
+
+    try {
+      connection = await db.promisePool.getConnection();
+      await connection.beginTransaction();
+      await connection.execute(deleteProjectsMembersSql);
+      await connection.execute(deleteMembersSql);
+      await connection.execute(deleteUsersSql);
+      await connection.commit();
+      return user;
+    } catch (err) {
+      console.log(err);
+      await connection.rollback();
+      throw err;
+    } finally {
+      if (connection) {
+        await connection.release();
+      }
+    }
+  }
+}
+
+module.exports = { User };
+```
+
+## Контроллер
+
+```js
+"use strict";
+
+const { User } = require("../models/Users.js");
+
+const asyncWrapper = (callback) => {
+  return async function (req, res) {
+    const args = [];
+    try {
+      if (req.params.id) {
+        args.push(req.params.id);
+      }
+      if (req.body) {
+        args.push(req.body);
+      }
+      const result = await callback(...args);
+      if (result.length) {
+        res.status(200).json({ result });
+      } else {
+        res.status(404).json({ errorMessage: "No such user" });
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(404).json({ errorMessage: err.message });
+    }
+  };
+};
+
+const getAllUsers = asyncWrapper(User.getAll);
+const getUserById = asyncWrapper(User.getById);
+const createUser = asyncWrapper(User.create);
+const updateUser = asyncWrapper(User.updateById);
+const deleteUser = asyncWrapper(User.deleteById);
+
+module.exports = {
+  getAllUsers,
+  getUserById,
+  createUser,
+  updateUser,
+  deleteUser,
+};
+```
